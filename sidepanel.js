@@ -29,9 +29,11 @@ function renderSkipped(meta) {
     skippedSummaryEl.textContent = "No skipped playlists.";
     skippedListEl.innerHTML = "";
     skippedDetailsEl.open = false;
+    skippedDetailsEl.style.display = "none";
     return;
   }
 
+  skippedDetailsEl.style.display = "block";
   const reasons = meta.skippedByReason || {};
   const parts = [
     reasons.folder ? `${reasons.folder} folders` : null,
@@ -79,7 +81,6 @@ function renderResults(results) {
 
   const fragment = document.createDocumentFragment();
   results.forEach((item) => {
-    const trackUrl = resolveTrackUrl(item);
     const card = document.createElement("div");
     card.className = "result";
 
@@ -90,10 +91,10 @@ function renderResults(results) {
       title.classList.add("clickable");
       title.addEventListener("click", () => openTrackInPlaylist(item));
       title.title = "Open playlist and highlight this song";
-    } else if (trackUrl) {
+    } else {
       title.classList.add("clickable");
-      title.addEventListener("click", () => openUrl(trackUrl));
-      title.title = "Open song in Apple Music";
+      title.addEventListener("click", () => openTrackInPlaylist(item));
+      title.title = "Open library and highlight this song";
     }
 
     const meta = document.createElement("div");
@@ -107,7 +108,9 @@ function renderResults(results) {
       const tag = document.createElement("div");
       tag.className = "tag";
       tag.textContent = playlistObj.name || "Playlist";
-      if (playlistObj.url) {
+      if (playlistObj.id === "__library__" || playlistObj.name === "No playlist") {
+        tag.title = "No playlist";
+      } else if (playlistObj.url) {
         tag.classList.add("clickable");
         tag.addEventListener("click", () => openUrl(playlistObj.url));
         tag.title = "Open playlist in Apple Music";
@@ -162,6 +165,7 @@ function requestSearch() {
 }
 
 function resolveTrackUrl(item) {
+  if (item.libraryUrl) return item.libraryUrl;
   if (item.url) return item.url;
   const pp = item.playParams;
   if (pp?.isLibrary && pp?.kind && pp?.id) {
@@ -173,6 +177,13 @@ function resolveTrackUrl(item) {
 function normalizePlaylist(entry) {
   if (!entry) return { name: "", url: "" };
   if (typeof entry === "string") return { name: entry, url: "" };
+  if (entry.id === "__library__" || entry.name === "No playlist") {
+    return {
+      id: "__library__",
+      name: "No playlist",
+      url: normalizeLibraryListUrl(entry.url) || "https://music.apple.com/library/songs"
+    };
+  }
   if (entry.url) return entry;
   if (entry.id) {
     return {
@@ -189,14 +200,29 @@ function openUrl(url) {
 
 function openTrackInPlaylist(item) {
   const playlist = pickPlaylistForTrack(item);
+  const fallbackList =
+    normalizeLibraryListUrl(item.libraryUrl) ||
+    normalizeLibraryListUrl(resolveTrackUrl(item)) ||
+    "https://music.apple.com/library/songs";
   if (!playlist?.url) {
-    const fallback = resolveTrackUrl(item);
-    if (fallback) openUrl(fallback);
+    chrome.runtime.sendMessage({
+      type: "open-playlist-track",
+      playlistUrl: fallbackList,
+      track: {
+        name: item.name,
+        artist: item.artist,
+        album: item.album
+      }
+    });
     return;
+  }
+  let playlistUrl = playlist.url;
+  if (playlist.id === "__library__" || playlist.name === "No playlist") {
+    playlistUrl = normalizeLibraryListUrl(playlistUrl) || fallbackList;
   }
   chrome.runtime.sendMessage({
     type: "open-playlist-track",
-    playlistUrl: playlist.url,
+    playlistUrl,
     track: {
       name: item.name,
       artist: item.artist,
@@ -225,6 +251,25 @@ function normalizeText(text) {
     .trim();
 }
 
+function normalizeLibraryListUrl(url) {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const idx = parts.findIndex((part) => part === "library");
+    if (idx >= 0 && parts[idx + 1] === "songs") {
+      const baseParts = parts.slice(0, idx + 2);
+      parsed.pathname = `/${baseParts.join("/")}`;
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.toString();
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
 const debouncedSearch = debounce(requestSearch, 200);
 
 indexBtn.addEventListener("click", () => {
@@ -244,6 +289,10 @@ fieldFilterEl.addEventListener("change", debouncedSearch);
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
+
+  if (msg.type === "index-reset-skipped") {
+    renderSkipped(null);
+  }
 
   if (msg.type === "index-status" && msg.message) {
     setStatus(msg.message);
@@ -289,6 +338,7 @@ chrome.runtime.sendMessage({ type: "get-state" }, (response) => {
     } else {
       setStatus("Not indexed yet. Open music.apple.com and sign in.");
     }
+    renderSkipped(null);
   }
 });
 

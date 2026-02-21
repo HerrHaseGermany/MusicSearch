@@ -6,6 +6,7 @@ const state = {
   auth: null,
   index: null,
   indexMeta: { builtAt: null, playlists: 0, tracks: 0 },
+  region: null,
   indexing: false,
   progress: { done: 0, total: 0 },
   lastError: null
@@ -24,6 +25,7 @@ async function loadIndex() {
 }
 
 loadIndex();
+loadRegion();
 
 function nowIso() {
   return new Date().toISOString();
@@ -315,6 +317,89 @@ function sanitizePlayParams(playParams) {
     isLibrary: !!isLibrary,
     catalogId: catalogId || null
   };
+}
+
+function extractRegionFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts[0] && /^[a-z]{2}$/i.test(parts[0])) {
+      return parts[0].toLowerCase();
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function buildMusicUrl(path) {
+  const prefix = state.region ? `/${state.region}` : "";
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return `https://music.apple.com${prefix}${normalized}`;
+}
+
+function normalizeMusicUrl(url) {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "music.apple.com") return url;
+    const currentRegion = state.region;
+    if (!currentRegion) return url;
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts[0] && /^[a-z]{2}$/i.test(parts[0])) {
+      if (parts[0].toLowerCase() === currentRegion) {
+        return url;
+      }
+      parts[0] = currentRegion;
+      parsed.pathname = `/${parts.join("/")}`;
+      return parsed.toString();
+    }
+    parsed.pathname = `/${currentRegion}${parsed.pathname}`;
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+async function loadRegion() {
+  try {
+    if (chrome.storage?.session) {
+      const stored = await chrome.storage.session.get(["region"]);
+      if (stored.region) state.region = stored.region;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function setRegion(region) {
+  if (!region || region === state.region) return;
+  state.region = region;
+  try {
+    if (chrome.storage?.session) {
+      await chrome.storage.session.set({ region });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function ensureRegion() {
+  if (state.region) return state.region;
+  const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*` });
+  for (const tab of tabs) {
+    const region = extractRegionFromUrl(tab.url || "");
+    if (region) {
+      await setRegion(region);
+      return region;
+    }
+  }
+  return null;
+}
+
+function librarySongUrl(songId) {
+  if (!songId) return null;
+  return buildMusicUrl(`/library/songs/${songId}`);
 }
 
 async function saveIndex(index, meta) {
@@ -644,6 +729,10 @@ async function buildIndex() {
     skippedByReason: { folder: 0, type: 0, notFound: 0 }
   };
   state.skippedSamples = [];
+  chrome.runtime.sendMessage({
+    type: "index-reset-skipped",
+    skipped: state.progress.skipped
+  });
   chrome.runtime.sendMessage({ type: "index-progress", progress: state.progress });
 
   const windowFocus = setInterval(() => {
@@ -651,6 +740,7 @@ async function buildIndex() {
   }, 5000);
 
   try {
+    await ensureRegion();
     const reloadInfo = await reloadMusicTab();
     if (reloadInfo?.reloaded) {
       chrome.runtime.sendMessage({ type: "index-status", message: "Reloading music.apple.com..." });
@@ -658,12 +748,48 @@ async function buildIndex() {
       await refreshAuth(8000);
     }
 
+    const trackMap = new Map();
+    let trackCount = 0;
+
+    chrome.runtime.sendMessage({ type: "index-status", message: "Indexing library songs..." });
+    const librarySongs = await fetchAllPages("/v1/me/library/songs?limit=100");
+    for (const song of librarySongs) {
+      const key = trackKey(song);
+      if (!key) continue;
+      const libraryUrl =
+        normalizeMusicUrl(song?.attributes?.url) || librarySongUrl(song.id);
+      const playParams = sanitizePlayParams(song?.attributes?.playParams);
+
+      if (trackMap.has(key)) {
+        const existing = trackMap.get(key);
+        if (!existing.url && song?.attributes?.url) {
+          existing.url = normalizeMusicUrl(song.attributes.url);
+        }
+        if (!existing.playParams && playParams) existing.playParams = playParams;
+        if (!existing.libraryUrl) existing.libraryUrl = libraryUrl;
+      } else {
+        trackMap.set(key, {
+          id: song.id || null,
+          name: song?.attributes?.name || "Unknown Title",
+          artist: song?.attributes?.artistName || "Unknown Artist",
+          album: song?.attributes?.albumName || "Unknown Album",
+          url: normalizeMusicUrl(song?.attributes?.url) || null,
+          playParams,
+          libraryUrl,
+          playlists: new Map()
+        });
+        trackCount += 1;
+      }
+    }
+
+    chrome.runtime.sendMessage({
+      type: "index-status",
+      message: `Indexed ${librarySongs.length} library songs. Indexing playlists...`
+    });
+
     const playlists = await fetchAllPages("/v1/me/library/playlists?limit=100");
     state.progress.total = playlists.length;
     chrome.runtime.sendMessage({ type: "index-progress", progress: state.progress });
-
-    const trackMap = new Map();
-    let trackCount = 0;
 
     for (const playlist of playlists) {
       if (playlist?.attributes?.isFolder || (playlist?.type && playlist.type !== "library-playlists")) {
@@ -683,8 +809,9 @@ async function buildIndex() {
       }
       const playlistId = playlist.id;
       const playlistName = playlist?.attributes?.name || "Untitled Playlist";
-      const playlistUrl =
-        playlist?.attributes?.url || `https://music.apple.com/library/playlist/${playlistId}`;
+      const playlistUrl = normalizeMusicUrl(
+        playlist?.attributes?.url || buildMusicUrl(`/library/playlist/${playlistId}`)
+      );
       let tracks = [];
       try {
         tracks = await fetchAllPages(`/v1/me/library/playlists/${playlistId}/tracks?limit=100`);
@@ -716,8 +843,9 @@ async function buildIndex() {
             name: track?.attributes?.name || "Unknown Title",
             artist: track?.attributes?.artistName || "Unknown Artist",
             album: track?.attributes?.albumName || "Unknown Album",
-            url: track?.attributes?.url || null,
+            url: normalizeMusicUrl(track?.attributes?.url) || null,
             playParams: sanitizePlayParams(track?.attributes?.playParams),
+            libraryUrl: null,
             playlists: new Map()
           });
           trackCount += 1;
@@ -733,17 +861,30 @@ async function buildIndex() {
       chrome.runtime.sendMessage({ type: "index-progress", progress: state.progress });
     }
 
-    const index = Array.from(trackMap.values()).map((track) => ({
-      ...track,
-      playlists: Array.from(track.playlists.values()).sort((a, b) =>
+    const index = Array.from(trackMap.values()).map((track) => {
+      const playlistEntries = Array.from(track.playlists.values()).sort((a, b) =>
         a.name.localeCompare(b.name)
-      )
-    }));
+      );
+
+      if (playlistEntries.length === 0) {
+        playlistEntries.push({
+          id: "__library__",
+          name: "No playlist",
+          url: buildMusicUrl("/library/songs")
+        });
+      }
+
+      return {
+        ...track,
+        playlists: playlistEntries
+      };
+    });
 
     const meta = {
       builtAt: nowIso(),
       playlists: playlists.length,
       tracks: trackCount,
+      librarySongs: librarySongs.length,
       skipped: state.progress.skipped || 0,
       skippedByReason: state.progress.skippedByReason,
       skippedSamples: state.skippedSamples
@@ -802,6 +943,7 @@ function searchIndex({ query, field, playlistFilter }) {
       album: track.album,
       url: track.url || null,
       playParams: track.playParams || null,
+      libraryUrl: track.libraryUrl || null,
       playlists
     });
   }
@@ -865,6 +1007,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse?.({ ok: true });
   }
 
+  if (msg.type === "set-region" && msg.region) {
+    setRegion(msg.region);
+    sendResponse?.({ ok: true });
+  }
+
   if (msg.type === "open-playlist-track" && msg.playlistUrl && msg.track) {
     openPlaylistAndHighlight(msg.playlistUrl, msg.track);
     sendResponse?.({ ok: true });
@@ -883,11 +1030,13 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 async function openInMusicTab(url) {
+  await ensureRegion();
+  const targetUrl = normalizeMusicUrl(url) || url;
   const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*` });
   if (tabs?.length) {
-    return await chrome.tabs.update(tabs[0].id, { url, active: true });
+    return await chrome.tabs.update(tabs[0].id, { url: targetUrl, active: true });
   } else {
-    return await chrome.tabs.create({ url });
+    return await chrome.tabs.create({ url: targetUrl });
   }
 }
 

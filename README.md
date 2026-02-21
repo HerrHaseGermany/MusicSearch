@@ -18,3 +18,4 @@ MusicSearch reuses the same authenticated session and tokens that the Apple Musi
 
 - Indexing time depends on how many playlists and tracks you have.
 - Your data stays local in the extension cache (no external servers).
+- Library-only songs appear under **No playlist**.

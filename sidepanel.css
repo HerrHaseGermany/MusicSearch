@@ -76,6 +76,7 @@ body::before {
 }
 
 .skipped {
+  display: none;
   padding: 10px 12px;
   border-radius: 12px;
   background: var(--panel);
