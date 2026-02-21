@@ -306,6 +306,17 @@ function trackKey(track) {
   return normalize(`${name}|${artist}|${album}|${duration}`);
 }
 
+function sanitizePlayParams(playParams) {
+  if (!playParams) return null;
+  const { id, kind, isLibrary, catalogId } = playParams;
+  return {
+    id: id || null,
+    kind: kind || null,
+    isLibrary: !!isLibrary,
+    catalogId: catalogId || null
+  };
+}
+
 async function saveIndex(index, meta) {
   await chrome.storage.local.set({ index, indexMeta: meta });
   state.index = index;
@@ -486,6 +497,50 @@ async function installBridgeOnAnyTab() {
   }
 }
 
+async function reloadMusicTab() {
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let targetTab = null;
+  if (activeTab?.url && activeTab.url.includes(PAGE_HOST)) {
+    targetTab = activeTab;
+  } else {
+    const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*` });
+    targetTab = tabs?.[0] || null;
+  }
+
+  if (!targetTab?.id) return { reloaded: false };
+  try {
+    await chrome.tabs.reload(targetTab.id, { bypassCache: true });
+    return { reloaded: true, tabId: targetTab.id };
+  } catch {
+    return { reloaded: false };
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timeout = setTimeout(() => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(false);
+    }, timeoutMs);
+
+    const listener = (updatedTabId, info) => {
+      if (updatedTabId !== tabId) return;
+      if (info.status === "complete") {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(true);
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
 async function fetchJson(pathOrUrl, allowRetry = true) {
   const auth = await ensureAuth();
   if (!auth) throw new Error("auth-missing");
@@ -596,6 +651,13 @@ async function buildIndex() {
   }, 5000);
 
   try {
+    const reloadInfo = await reloadMusicTab();
+    if (reloadInfo?.reloaded) {
+      chrome.runtime.sendMessage({ type: "index-status", message: "Reloading music.apple.com..." });
+      await waitForTabComplete(reloadInfo.tabId, 20000);
+      await refreshAuth(8000);
+    }
+
     const playlists = await fetchAllPages("/v1/me/library/playlists?limit=100");
     state.progress.total = playlists.length;
     chrome.runtime.sendMessage({ type: "index-progress", progress: state.progress });
@@ -621,6 +683,8 @@ async function buildIndex() {
       }
       const playlistId = playlist.id;
       const playlistName = playlist?.attributes?.name || "Untitled Playlist";
+      const playlistUrl =
+        playlist?.attributes?.url || `https://music.apple.com/library/playlist/${playlistId}`;
       let tracks = [];
       try {
         tracks = await fetchAllPages(`/v1/me/library/playlists/${playlistId}/tracks?limit=100`);
@@ -652,11 +716,17 @@ async function buildIndex() {
             name: track?.attributes?.name || "Unknown Title",
             artist: track?.attributes?.artistName || "Unknown Artist",
             album: track?.attributes?.albumName || "Unknown Album",
-            playlists: new Set()
+            url: track?.attributes?.url || null,
+            playParams: sanitizePlayParams(track?.attributes?.playParams),
+            playlists: new Map()
           });
           trackCount += 1;
         }
-        trackMap.get(key).playlists.add(playlistName);
+        trackMap.get(key).playlists.set(playlistId, {
+          id: playlistId,
+          name: playlistName,
+          url: playlistUrl
+        });
       }
 
       state.progress.done += 1;
@@ -665,7 +735,9 @@ async function buildIndex() {
 
     const index = Array.from(trackMap.values()).map((track) => ({
       ...track,
-      playlists: Array.from(track.playlists).sort()
+      playlists: Array.from(track.playlists.values()).sort((a, b) =>
+        a.name.localeCompare(b.name)
+      )
     }));
 
     const meta = {
@@ -718,7 +790,9 @@ function searchIndex({ query, field, playlistFilter }) {
 
     let playlists = track.playlists;
     if (playlistNeedle) {
-      playlists = playlists.filter((name) => normalize(name).includes(playlistNeedle));
+      playlists = playlists.filter((entry) =>
+        normalize(typeof entry === "string" ? entry : entry.name).includes(playlistNeedle)
+      );
       if (playlists.length === 0) continue;
     }
 
@@ -726,6 +800,8 @@ function searchIndex({ query, field, playlistFilter }) {
       name: track.name,
       artist: track.artist,
       album: track.album,
+      url: track.url || null,
+      playParams: track.playParams || null,
       playlists
     });
   }
@@ -784,6 +860,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse?.({ ok: true });
   }
 
+  if (msg.type === "open-url" && msg.url) {
+    openInMusicTab(msg.url);
+    sendResponse?.({ ok: true });
+  }
+
+  if (msg.type === "open-playlist-track" && msg.playlistUrl && msg.track) {
+    openPlaylistAndHighlight(msg.playlistUrl, msg.track);
+    sendResponse?.({ ok: true });
+  }
+
   if (msg.type === "install-bridge" && sender?.tab?.id) {
     installBridgeOnTab(sender.tab.id);
     sendResponse?.({ ok: true });
@@ -795,6 +881,25 @@ chrome.action.onClicked.addListener(async (tab) => {
     await chrome.sidePanel.open({ tabId: tab.id });
   }
 });
+
+async function openInMusicTab(url) {
+  const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*` });
+  if (tabs?.length) {
+    return await chrome.tabs.update(tabs[0].id, { url, active: true });
+  } else {
+    return await chrome.tabs.create({ url });
+  }
+}
+
+async function openPlaylistAndHighlight(playlistUrl, track) {
+  const tab = await openInMusicTab(playlistUrl);
+  if (!tab?.id) return;
+  await waitForTabComplete(tab.id, 20000);
+  await sendMessageToTab(tab.id, {
+    type: "highlight-track",
+    track
+  });
+}
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {

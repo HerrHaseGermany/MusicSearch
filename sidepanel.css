@@ -2,15 +2,15 @@
 
 :root {
   color-scheme: light;
-  --bg-1: #f4efe8;
-  --bg-2: #e4f3ee;
+  --bg-1: #fff4f4;
+  --bg-2: #ffe1e1;
   --panel: rgba(255, 255, 255, 0.78);
   --panel-strong: rgba(255, 255, 255, 0.92);
   --text: #1f2a32;
   --muted: #58656f;
-  --accent: #0f766e;
-  --accent-strong: #115e59;
-  --accent-2: #d97706;
+  --accent: #fa243c;
+  --accent-strong: #d61b32;
+  --accent-2: #b91c1c;
   --border: rgba(25, 32, 35, 0.12);
   --shadow: 0 24px 48px rgba(18, 38, 32, 0.12);
 }
@@ -180,6 +180,14 @@ body::before {
   font-weight: 600;
 }
 
+.clickable {
+  cursor: pointer;
+}
+
+.clickable:hover {
+  color: var(--accent-strong);
+}
+
 .result-meta {
   font-size: 12px;
   color: var(--muted);
@@ -197,6 +205,7 @@ body::before {
   background: rgba(15, 118, 110, 0.12);
   color: var(--accent-strong);
   font-size: 11px;
+  font-weight: 700;
 }
 
 .btn {

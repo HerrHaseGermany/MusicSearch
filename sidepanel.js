@@ -79,12 +79,22 @@ function renderResults(results) {
 
   const fragment = document.createDocumentFragment();
   results.forEach((item) => {
+    const trackUrl = resolveTrackUrl(item);
     const card = document.createElement("div");
     card.className = "result";
 
     const title = document.createElement("div");
     title.className = "result-title";
     title.textContent = `${item.name} — ${item.artist}`;
+    if (item.playlists && item.playlists.length) {
+      title.classList.add("clickable");
+      title.addEventListener("click", () => openTrackInPlaylist(item));
+      title.title = "Open playlist and highlight this song";
+    } else if (trackUrl) {
+      title.classList.add("clickable");
+      title.addEventListener("click", () => openUrl(trackUrl));
+      title.title = "Open song in Apple Music";
+    }
 
     const meta = document.createElement("div");
     meta.className = "result-meta";
@@ -93,9 +103,15 @@ function renderResults(results) {
     const tags = document.createElement("div");
     tags.className = "tags";
     item.playlists.forEach((playlist) => {
+      const playlistObj = normalizePlaylist(playlist);
       const tag = document.createElement("div");
       tag.className = "tag";
-      tag.textContent = playlist;
+      tag.textContent = playlistObj.name || "Playlist";
+      if (playlistObj.url) {
+        tag.classList.add("clickable");
+        tag.addEventListener("click", () => openUrl(playlistObj.url));
+        tag.title = "Open playlist in Apple Music";
+      }
       tags.appendChild(tag);
     });
 
@@ -145,6 +161,70 @@ function requestSearch() {
   });
 }
 
+function resolveTrackUrl(item) {
+  if (item.url) return item.url;
+  const pp = item.playParams;
+  if (pp?.isLibrary && pp?.kind && pp?.id) {
+    return `https://music.apple.com/library/${pp.kind}/${pp.id}`;
+  }
+  return null;
+}
+
+function normalizePlaylist(entry) {
+  if (!entry) return { name: "", url: "" };
+  if (typeof entry === "string") return { name: entry, url: "" };
+  if (entry.url) return entry;
+  if (entry.id) {
+    return {
+      name: entry.name || entry.id,
+      url: `https://music.apple.com/library/playlist/${entry.id}`
+    };
+  }
+  return { name: entry.name || "", url: "" };
+}
+
+function openUrl(url) {
+  chrome.runtime.sendMessage({ type: "open-url", url });
+}
+
+function openTrackInPlaylist(item) {
+  const playlist = pickPlaylistForTrack(item);
+  if (!playlist?.url) {
+    const fallback = resolveTrackUrl(item);
+    if (fallback) openUrl(fallback);
+    return;
+  }
+  chrome.runtime.sendMessage({
+    type: "open-playlist-track",
+    playlistUrl: playlist.url,
+    track: {
+      name: item.name,
+      artist: item.artist,
+      album: item.album
+    }
+  });
+}
+
+function pickPlaylistForTrack(item) {
+  if (!item?.playlists?.length) return null;
+  const normalized = item.playlists.map(normalizePlaylist);
+  const needle = normalizeText(playlistFilterEl.value || "");
+  if (needle) {
+    const match = normalized.find((p) => normalizeText(p.name).includes(needle));
+    if (match) return match;
+  }
+  return normalized[0];
+}
+
+function normalizeText(text) {
+  if (!text) return "";
+  return text
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
 const debouncedSearch = debounce(requestSearch, 200);
 
 indexBtn.addEventListener("click", () => {
@@ -164,6 +244,10 @@ fieldFilterEl.addEventListener("change", debouncedSearch);
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
+
+  if (msg.type === "index-status" && msg.message) {
+    setStatus(msg.message);
+  }
 
   if (msg.type === "index-progress") {
     lastProgress = msg.progress;
