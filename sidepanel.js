@@ -1,0 +1,213 @@
+const statusEl = document.getElementById("status");
+const indexBtn = document.getElementById("indexBtn");
+const playlistFilterEl = document.getElementById("playlistFilter");
+const fieldFilterEl = document.getElementById("fieldFilter");
+const queryEl = document.getElementById("query");
+const clearBtn = document.getElementById("clearBtn");
+const resultsEl = document.getElementById("results");
+const skippedDetailsEl = document.getElementById("skippedDetails");
+const skippedSummaryEl = document.getElementById("skippedSummary");
+const skippedListEl = document.getElementById("skippedList");
+
+let lastMeta = null;
+let lastProgress = null;
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function formatMeta(meta) {
+  if (!meta || !meta.builtAt) return "Not indexed yet.";
+  const date = new Date(meta.builtAt);
+  const skipped = meta.skipped ? ` · ${meta.skipped} skipped` : "";
+  const summary = `${meta.playlists} playlists · ${meta.tracks} tracks${skipped}`;
+  return `Indexed ${summary} · ${date.toLocaleString()}`;
+}
+
+function renderSkipped(meta) {
+  if (!meta || !meta.skipped) {
+    skippedSummaryEl.textContent = "No skipped playlists.";
+    skippedListEl.innerHTML = "";
+    skippedDetailsEl.open = false;
+    return;
+  }
+
+  const reasons = meta.skippedByReason || {};
+  const parts = [
+    reasons.folder ? `${reasons.folder} folders` : null,
+    reasons.type ? `${reasons.type} non-playlist items` : null,
+    reasons.notFound ? `${reasons.notFound} not found` : null
+  ].filter(Boolean);
+
+  skippedSummaryEl.textContent = parts.length
+    ? `Skipped ${meta.skipped} total: ${parts.join(", ")}.`
+    : `Skipped ${meta.skipped} total.`;
+
+  skippedListEl.innerHTML = "";
+  const samples = meta.skippedSamples || [];
+  samples.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "skipped-item";
+
+    const name = document.createElement("div");
+    name.textContent = item.name || item.id || "Unknown";
+
+    const reason = document.createElement("div");
+    reason.className = "skipped-reason";
+    reason.textContent = item.reason || "unknown";
+
+    row.appendChild(name);
+    row.appendChild(reason);
+    skippedListEl.appendChild(row);
+  });
+}
+
+function renderEmpty(message) {
+  resultsEl.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "empty";
+  div.textContent = message;
+  resultsEl.appendChild(div);
+}
+
+function renderResults(results) {
+  resultsEl.innerHTML = "";
+  if (!results || results.length === 0) {
+    renderEmpty("No matches yet. Try another query.");
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  results.forEach((item) => {
+    const card = document.createElement("div");
+    card.className = "result";
+
+    const title = document.createElement("div");
+    title.className = "result-title";
+    title.textContent = `${item.name} — ${item.artist}`;
+
+    const meta = document.createElement("div");
+    meta.className = "result-meta";
+    meta.textContent = item.album || "";
+
+    const tags = document.createElement("div");
+    tags.className = "tags";
+    item.playlists.forEach((playlist) => {
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = playlist;
+      tags.appendChild(tag);
+    });
+
+    card.appendChild(title);
+    card.appendChild(meta);
+    card.appendChild(tags);
+    fragment.appendChild(card);
+  });
+
+  resultsEl.appendChild(fragment);
+}
+
+function debounce(fn, wait) {
+  let timeout;
+  return (...args) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => fn(...args), wait);
+  };
+}
+
+function currentSearchPayload() {
+  return {
+    type: "search",
+    query: queryEl.value || "",
+    field: fieldFilterEl.value || "all",
+    playlistFilter: playlistFilterEl.value || ""
+  };
+}
+
+function requestSearch() {
+  const payload = currentSearchPayload();
+  if (!payload.query.trim()) {
+    renderEmpty("Type a song name to search your playlists.");
+    return;
+  }
+
+  chrome.runtime.sendMessage(payload, (response) => {
+    if (chrome.runtime.lastError) {
+      renderEmpty("Extension error. Reload the side panel.");
+      return;
+    }
+    if (response?.error) {
+      renderEmpty(response.error);
+      return;
+    }
+    renderResults(response?.results || []);
+  });
+}
+
+const debouncedSearch = debounce(requestSearch, 200);
+
+indexBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "request-auth" });
+  chrome.runtime.sendMessage({ type: "start-index" });
+  setStatus("Indexing started. Keep this panel open.");
+});
+
+clearBtn.addEventListener("click", () => {
+  queryEl.value = "";
+  requestSearch();
+});
+
+queryEl.addEventListener("input", debouncedSearch);
+playlistFilterEl.addEventListener("input", debouncedSearch);
+fieldFilterEl.addEventListener("change", debouncedSearch);
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || !msg.type) return;
+
+  if (msg.type === "index-progress") {
+    lastProgress = msg.progress;
+    const total = lastProgress?.total || 0;
+    const done = lastProgress?.done || 0;
+    const skipped = lastProgress?.skipped || 0;
+    if (total > 0) {
+      const skippedText = skipped ? ` · ${skipped} skipped` : "";
+      setStatus(`Indexing ${done}/${total} playlists${skippedText}...`);
+    } else {
+      setStatus("Indexing playlists...");
+    }
+  }
+
+  if (msg.type === "index-complete") {
+    lastMeta = msg.meta;
+    setStatus(formatMeta(lastMeta));
+    renderSkipped(lastMeta);
+  }
+
+  if (msg.type === "index-error") {
+    setStatus(`Index failed: ${msg.error}`);
+  }
+});
+
+chrome.runtime.sendMessage({ type: "get-state" }, (response) => {
+  if (chrome.runtime.lastError) return;
+  if (response?.indexing) {
+    setStatus("Indexing... Keep this panel open.");
+    return;
+  }
+  if (response?.meta?.builtAt) {
+    lastMeta = response.meta;
+    setStatus(formatMeta(lastMeta));
+    renderSkipped(lastMeta);
+  } else {
+    if (response?.auth) {
+      setStatus("Auth captured. Click Index Library to build search.");
+    } else {
+      setStatus("Not indexed yet. Open music.apple.com and sign in.");
+    }
+  }
+});
+
+chrome.runtime.sendMessage({ type: "request-auth" });
+
+renderEmpty("Type a song name to search your playlists.");

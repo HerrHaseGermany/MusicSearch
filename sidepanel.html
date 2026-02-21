@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Apple Music Playlist Search</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <div class="panel">
+      <header class="header">
+        <div>
+          <div class="title">MusicSearch</div>
+          <div class="subtitle">Advanced search for your Apple Music library.</div>
+        </div>
+        <button id="indexBtn" class="btn btn-primary">Index Library</button>
+      </header>
+
+      <div id="status" class="status">Idle. Open music.apple.com and sign in.</div>
+      <details id="skippedDetails" class="skipped">
+        <summary>Skipped playlists</summary>
+        <div id="skippedSummary" class="skipped-summary">No skipped playlists.</div>
+        <div id="skippedList" class="skipped-list"></div>
+      </details>
+
+      <div class="filters">
+        <label class="field">
+          <span>Search In</span>
+          <input
+            id="playlistFilter"
+            type="text"
+            placeholder="All playlists or filter by name"
+            autocomplete="off"
+          />
+        </label>
+        <label class="field">
+          <span>Field</span>
+          <select id="fieldFilter">
+            <option value="all">All fields</option>
+            <option value="title">Title only</option>
+            <option value="artist">Artist only</option>
+            <option value="album">Album only</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="searchbar">
+        <input id="query" type="search" placeholder="Search songs..." autocomplete="off" />
+        <button id="clearBtn" class="btn btn-ghost">Clear</button>
+      </div>
+
+      <div id="results" class="results"></div>
+    </div>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
