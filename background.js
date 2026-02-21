@@ -11,6 +11,8 @@ const state = {
   progress: { done: 0, total: 0 },
   lastError: null
 };
+const enabledWindows = new Set();
+const panelStateByTab = new Map();
 
 async function loadIndex() {
   const stored = await chrome.storage.local.get(["index", "indexMeta"]);
@@ -26,9 +28,23 @@ async function loadIndex() {
 
 loadIndex();
 loadRegion();
+loadEnabledWindows();
+setPanelBehavior();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isMusicUrl(url) {
+  return !!url && url.includes(`https://${PAGE_HOST}/`);
+}
+
+async function setPanelBehavior() {
+  try {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  } catch {
+    // ignore
+  }
 }
 
 function normalizeBearer(value) {
@@ -366,6 +382,29 @@ async function loadRegion() {
     if (chrome.storage?.session) {
       const stored = await chrome.storage.session.get(["region"]);
       if (stored.region) state.region = stored.region;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function loadEnabledWindows() {
+  try {
+    if (chrome.storage?.session) {
+      const stored = await chrome.storage.session.get(["enabledWindows"]);
+      if (Array.isArray(stored.enabledWindows)) {
+        stored.enabledWindows.forEach((id) => enabledWindows.add(id));
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function saveEnabledWindows() {
+  try {
+    if (chrome.storage?.session) {
+      await chrome.storage.session.set({ enabledWindows: Array.from(enabledWindows) });
     }
   } catch {
     // ignore
@@ -740,6 +779,7 @@ async function buildIndex() {
   }, 5000);
 
   try {
+    await ensureMusicTabInFocusedWindow();
     await ensureRegion();
     const reloadInfo = await reloadMusicTab();
     if (reloadInfo?.reloaded) {
@@ -983,6 +1023,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  if (msg.type === "ensure-music-tab") {
+    ensureMusicTabInFocusedWindow();
+    sendResponse?.({ ok: true });
+    return;
+  }
+
   if (msg.type === "search") {
     sendResponse?.(searchIndex(msg));
     return;
@@ -1023,10 +1069,92 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-chrome.action.onClicked.addListener(async (tab) => {
-  if (tab?.id) {
-    await chrome.sidePanel.open({ tabId: tab.id });
+chrome.action.onClicked.addListener((tab) => {
+  const handleWindow = (windowId) => {
+    if (typeof windowId !== "number") return;
+    enabledWindows.add(windowId);
+    saveEnabledWindows();
+
+    const enableMusicTab = (tabId, url, targetWindowId) => {
+      if (!tabId) return;
+      if (typeof targetWindowId === "number") {
+        enabledWindows.add(targetWindowId);
+        saveEnabledWindows();
+      }
+      setPanelForTab(tabId, url, targetWindowId);
+    };
+
+    chrome.tabs.query({ url: `https://${PAGE_HOST}/*`, windowId }, (tabs) => {
+      if (chrome.runtime.lastError) {
+        chrome.tabs.create({ url: buildMusicUrl("/"), active: true }, (created) =>
+          enableMusicTab(created?.id, created?.url, created?.windowId)
+        );
+        return;
+      }
+      const existing = tabs && tabs.length ? tabs[0] : null;
+      if (existing?.id) {
+        chrome.windows.update(windowId, { focused: true }, () => {
+          chrome.tabs.update(existing.id, { active: true }, () => {
+            if (chrome.runtime.lastError) {
+              chrome.tabs.create({ url: buildMusicUrl("/"), active: true }, (created) =>
+                enableMusicTab(created?.id, created?.url, created?.windowId)
+              );
+              return;
+            }
+            enableMusicTab(existing.id, existing.url, existing.windowId);
+          });
+        });
+      } else {
+        chrome.tabs.create(
+          { url: buildMusicUrl("/"), windowId, active: true },
+          (created) => {
+            if (chrome.runtime.lastError || !created?.id) {
+              chrome.tabs.create({ url: buildMusicUrl("/"), active: true }, (fallback) =>
+                enableMusicTab(fallback?.id, fallback?.url, fallback?.windowId)
+              );
+              return;
+            }
+            enableMusicTab(created?.id, created?.url, created?.windowId ?? windowId);
+          }
+        );
+      }
+    });
+  };
+
+  if (typeof tab?.windowId === "number") {
+    handleWindow(tab.windowId);
+  } else {
+    chrome.windows.getLastFocused((win) => handleWindow(win?.id));
   }
+});
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!enabledWindows.has(tab.windowId)) {
+      await setSidePanelEnabled(tabId, false);
+      return;
+    }
+    await setPanelForTab(tabId, tab?.url, tab.windowId);
+  } catch {
+    // ignore
+  }
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (!info.url && info.status !== "complete") return;
+  if (!enabledWindows.has(tab.windowId)) return;
+  await setPanelForTab(tabId, tab?.url, tab.windowId);
+});
+
+chrome.windows.onRemoved.addListener(async (windowId) => {
+  if (enabledWindows.delete(windowId)) {
+    await saveEnabledWindows();
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  panelStateByTab.delete(tabId);
 });
 
 async function openInMusicTab(url) {
@@ -1037,6 +1165,64 @@ async function openInMusicTab(url) {
     return await chrome.tabs.update(tabs[0].id, { url: targetUrl, active: true });
   } else {
     return await chrome.tabs.create({ url: targetUrl });
+  }
+}
+
+async function openOrFocusMusicTab() {
+  const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*` });
+  if (tabs?.length) {
+    return await chrome.tabs.update(tabs[0].id, { active: true });
+  }
+  return await chrome.tabs.create({ url: buildMusicUrl("/") });
+}
+
+async function ensureMusicTabInFocusedWindow() {
+  try {
+    const win = await chrome.windows.getLastFocused();
+    const windowId = win?.id;
+    if (!windowId) return null;
+    const tabs = await chrome.tabs.query({ url: `https://${PAGE_HOST}/*`, windowId });
+    if (tabs?.length) {
+      await chrome.tabs.update(tabs[0].id, { active: true });
+      return tabs[0];
+    }
+    return await chrome.tabs.create({ url: buildMusicUrl("/"), windowId, active: true });
+  } catch {
+    return null;
+  }
+}
+
+async function setSidePanelEnabled(tabId, enabled) {
+  try {
+    await chrome.sidePanel.setOptions({ tabId, enabled });
+    panelStateByTab.set(tabId, { enabled, path: null });
+  } catch {
+    // ignore
+  }
+}
+
+async function setPanelForTab(tabId, url, windowId) {
+  if (!tabId) return;
+  const isEnabled = typeof windowId === "number" ? enabledWindows.has(windowId) : true;
+  if (!isMusicUrl(url)) {
+    const last = panelStateByTab.get(tabId);
+    if (last && last.enabled === false) return;
+    try {
+      await chrome.sidePanel.setOptions({ tabId, enabled: false });
+      panelStateByTab.set(tabId, { enabled: false, path: null });
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  const last = panelStateByTab.get(tabId);
+  if (last && last.enabled === isEnabled && last.path === "sidepanel.html") return;
+  try {
+    await chrome.sidePanel.setOptions({ tabId, enabled: isEnabled, path: "sidepanel.html" });
+    panelStateByTab.set(tabId, { enabled: isEnabled, path: "sidepanel.html" });
+  } catch {
+    // ignore
   }
 }
 

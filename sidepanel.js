@@ -273,6 +273,7 @@ function normalizeLibraryListUrl(url) {
 const debouncedSearch = debounce(requestSearch, 200);
 
 indexBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "ensure-music-tab" });
   chrome.runtime.sendMessage({ type: "request-auth" });
   chrome.runtime.sendMessage({ type: "start-index" });
   setStatus("Indexing started. Keep this panel open.");
