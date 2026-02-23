@@ -11,6 +11,46 @@ const skippedListEl = document.getElementById("skippedList");
 
 let lastMeta = null;
 let lastProgress = null;
+let lastActiveSupported = null;
+
+function isSupportedTabUrl(urlValue) {
+  if (!urlValue) return false;
+  try {
+    const url = new URL(urlValue);
+    return url.hostname === "music.apple.com";
+  } catch {
+    return false;
+  }
+}
+
+function getTabSupportStatus(tab) {
+  if (!tab) return null;
+  if (tab.pendingUrl) return isSupportedTabUrl(tab.pendingUrl);
+  if (!tab.url) return null;
+  if (tab.url === "about:blank" || tab.url.startsWith("chrome://newtab")) {
+    return false;
+  }
+  return isSupportedTabUrl(tab.url);
+}
+
+function closePanelIfSwitchedToUnsupported(tab) {
+  if (!tab) {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      closePanelIfSwitchedToUnsupported(tabs[0]);
+    });
+    return;
+  }
+  const isSupported = getTabSupportStatus(tab);
+  if (isSupported === null) return;
+  if (lastActiveSupported === null) {
+    lastActiveSupported = isSupported;
+    return;
+  }
+  if (lastActiveSupported && !isSupported) {
+    window.close();
+  }
+  lastActiveSupported = isSupported;
+}
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -287,6 +327,19 @@ clearBtn.addEventListener("click", () => {
 queryEl.addEventListener("input", debouncedSearch);
 playlistFilterEl.addEventListener("input", debouncedSearch);
 fieldFilterEl.addEventListener("change", debouncedSearch);
+
+closePanelIfSwitchedToUnsupported();
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId, (tab) => {
+    closePanelIfSwitchedToUnsupported(tab);
+  });
+});
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (!tab || !tab.active) return;
+  if (info.url || info.status === "complete" || info.pendingUrl) {
+    closePanelIfSwitchedToUnsupported(tab);
+  }
+});
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
